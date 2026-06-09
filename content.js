@@ -1,115 +1,148 @@
 /**
  * content.js — X.com DOM Interaction Engine
  *
- * Injected into all x.com pages by the manifest. Exposes a message listener
+ * Injected into all x.com pages at document_idle. Exposes a message listener
  * so the background service worker can dispatch commands (join, post, follow)
- * that are executed by safely querying the DOM using semantic selectors
- * (ARIA roles, data-testid, textContent matching) instead of fragile CSS classes.
+ * that interact with X's heavy React-rendered UI.
  *
- * All actions include randomised delays to appear human-like.
+ * All DOM queries use active polling (every 500ms, up to 15s) to handle
+ * X's dynamic component mounting. Typing uses document.execCommand('insertText')
+ * inside a typewriter loop to properly update React's internal input state.
+ *
+ * Pattern: waitForElementAndExecute → locate element → human delay → act → respond()
  */
 
 (function () {
   'use strict';
 
   /* ────────────────────────────────────────────────────────────────
+   *  Constants
+   * ──────────────────────────────────────────────────────────────── */
+
+  const POLL_INTERVAL_MS = 500;
+  const POLL_TIMEOUT_MS = 15000;
+  const KEYSTROKE_DELAY_MIN = 50;
+  const KEYSTROKE_DELAY_MAX = 150;
+
+  /* ────────────────────────────────────────────────────────────────
    *  Utility Helpers
    * ──────────────────────────────────────────────────────────────── */
 
-  /** Return a random integer between min and max (inclusive). */
   const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
-
-  /** Sleep for `ms` milliseconds. */
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   /**
-   * Simulate human typing into a contenteditable element.
-   * Splits `text` into characters and dispatches `beforeinput` + `input` events
-   * with a randomised delay (50-150ms) between each keystroke.
+   * Active polling: scan the DOM every `pollInterval` ms until the predicate
+   * returns a truthy element, or `timeout` ms elapses.
+   *
+   * @param {() => HTMLElement|null} predicate - synchronous DOM check
+   * @param {number} [timeout] - max ms to poll (default 15000)
+   * @param {number} [pollInterval] - ms between polls (default 500)
+   * @returns {Promise<HTMLElement|null>}
+   */
+  async function waitForElementAndExecute(predicate, timeout = POLL_TIMEOUT_MS, pollInterval = POLL_INTERVAL_MS) {
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      const el = predicate();
+      if (el) return el;
+      await sleep(pollInterval);
+    }
+    return predicate(); // one last try
+  }
+
+  /**
+   * Find the closest clickable element for a matched inner node.
+   * Searches up the ancestor chain for button / [role="button"] / a.
+   */
+  function closestClickable(el) {
+    if (!el) return null;
+    if (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button' || el.tagName === 'A') return el;
+    return el.closest('button, [role="button"], a');
+  }
+
+  /**
+   * Match textContent (trimmed) against a string, case-insensitive.
+   */
+  function textMatches(el, target) {
+    if (!el || !el.textContent) return false;
+    return el.textContent.trim().toLowerCase() === target.toLowerCase();
+  }
+
+  /**
+   * Poll for an element whose text matches `target` (case-insensitive),
+   * scanning across button / [role="button"] / span / div elements.
+   * Returns the clickable parent node (via closestClickable) or null.
+   */
+  async function findButtonByText(target, timeout = POLL_TIMEOUT_MS) {
+    return waitForElementAndExecute(() => {
+      // Scan all common interactive + text nodes
+      const candidates = document.querySelectorAll(
+        'button, [role="button"], a, span, div[role="button"]'
+      );
+      for (const el of candidates) {
+        if (textMatches(el, target)) {
+          const clickable = closestClickable(el);
+          if (clickable && clickable.offsetParent !== null) return clickable;
+        }
+      }
+      return null;
+    }, timeout);
+  }
+
+  /**
+   * Simulate human typing into a contenteditable element using
+   * document.execCommand('insertText') in a typewriter loop.
+   * This properly triggers X's React input listeners.
    */
   async function simulateTyping(element, text) {
     element.focus();
-    // Focus may need a moment
-    await sleep(300 + rand(0, 400));
+    await sleep(rand(300, 800));
 
+    // Focus the element by placing a cursor at the end
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    range.collapse(false); // collapse to end
+    selection.removeAllRanges();
+    selection.addRange(range);
+
+    await sleep(rand(200, 400));
+
+    // Clear existing placeholder content safely
+    if (element.textContent.trim().length > 0) {
+      element.textContent = '';
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+      await sleep(rand(100, 300));
+    }
+
+    // Typewriter loop — one character at a time
     for (let i = 0; i < text.length; i++) {
       const char = text[i];
 
-      // Dispatch a beforeinput event first (as real browsers do)
-      element.dispatchEvent(
-        new InputEvent('beforeinput', {
-          inputType: 'insertText',
-          data: char,
-          bubbles: true,
-          cancelable: true,
-        })
-      );
+      // Focus the element before each keystroke to keep React's cursor alive
+      element.focus();
+      const sel = window.getSelection();
+      const r = document.createRange();
+      r.selectNodeContents(element);
+      r.collapse(false);
+      sel.removeAllRanges();
+      sel.addRange(r);
 
-      // Update the textContent progressively
-      const currentText = element.textContent || '';
-      element.textContent = currentText + char;
+      // Use execCommand to insert the character — this triggers X's React state
+      document.execCommand('insertText', false, char);
 
-      // Dispatch the actual input event
-      element.dispatchEvent(
-        new InputEvent('input', {
-          inputType: 'insertText',
-          data: char,
-          bubbles: true,
-          cancelable: true,
-        })
-      );
+      // Dispatch additional events for stealth / compatibility
+      element.dispatchEvent(new KeyboardEvent('keydown', { key: char, bubbles: true }));
+      element.dispatchEvent(new KeyboardEvent('keypress', { key: char, bubbles: true }));
+      element.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true }));
 
-      // Dispatch a synthetic keydown/keyup for stealth
-      element.dispatchEvent(
-        new KeyboardEvent('keydown', { key: char, bubbles: true })
-      );
-      element.dispatchEvent(
-        new KeyboardEvent('keyup', { key: char, bubbles: true })
-      );
-
-      // Random delay between keystrokes: 50-150ms
-      await sleep(rand(50, 150));
+      // Randomised human-like delay between keystrokes
+      await sleep(rand(KEYSTROKE_DELAY_MIN, KEYSTROKE_DELAY_MAX));
     }
 
-    // Trigger a final change event so React/Svelte listeners pick up the update
+    // Final change event so any remaining listeners pick up completion
     element.dispatchEvent(new Event('change', { bubbles: true }));
-  }
-
-  /**
-   * Wait for an element matching `selector` to appear in the DOM.
-   * Checks every 500ms until `timeout` ms have elapsed.
-   * Returns the element or null.
-   */
-  async function waitForElement(selector, timeout = 15000) {
-    const start = Date.now();
-    while (Date.now() - start < timeout) {
-      const el = document.querySelector(selector);
-      if (el) return el;
-      await sleep(rand(300, 700));
-    }
-    // One last try
-    return document.querySelector(selector);
-  }
-
-  /**
-   * Wait for an element whose textContent (trimmed) equals `text`
-   * and whose role or tag matches expectations.
-   */
-  async function waitForElementByText(role, text, timeout = 15000) {
-    const start = Date.now();
-    while (Date.now() - start < timeout) {
-      const candidates = document.querySelectorAll(`[role="${role}"]`);
-      for (const el of candidates) {
-        if (el.textContent.trim() === text) return el;
-      }
-      await sleep(rand(300, 700));
-    }
-    // Final attempt
-    const candidates = document.querySelectorAll(`[role="${role}"]`);
-    for (const el of candidates) {
-      if (el.textContent.trim() === text) return el;
-    }
-    return null;
+    await sleep(rand(200, 500));
   }
 
   /* ────────────────────────────────────────────────────────────────
@@ -118,180 +151,171 @@
 
   /**
    * JOIN a community on the current page.
-   * Looks for a "Join" button by role="button" and exact text match.
+   * Actively polls for a clickable element whose textContent matches "join"
+   * (case-insensitive) across all button, [role="button"], span nodes.
+   * Uses .closest('[role="button"]') to find the actual clickable node.
    */
   async function actionJoinCommunity() {
-    // Wait for page to settle
-    await sleep(rand(2000, 4000));
+    // Let page settle after navigation
+    await sleep(rand(1500, 3000));
 
-    // Try finding the Join button using various strategies
-    let joinBtn = await waitForElementByText('button', 'Join', 10000);
-
-    if (!joinBtn) {
-      // Fallback: look for any element with text "Join" that is clickable
-      const allElements = document.querySelectorAll(
-        'button, [role="button"], a, span'
-      );
-      for (const el of allElements) {
-        const text = el.textContent.trim();
-        if (
-          text === 'Join' &&
-          (el.tagName === 'BUTTON' ||
-            el.getAttribute('role') === 'button' ||
-            el.tagName === 'A')
-        ) {
-          joinBtn = el;
-          break;
-        }
-      }
-    }
+    // Poll for the Join button (up to 15s)
+    const joinBtn = await findButtonByText('join', POLL_TIMEOUT_MS);
 
     if (!joinBtn) {
-      return { success: false, error: 'Join button not found on this page.' };
+      return { success: false, error: 'Join button not found after polling.' };
     }
 
-    // Random pre-click hesitation
-    await sleep(rand(800, 2000));
-
-    // Scroll element into view smoothly
+    // Scroll into view with human-like hesitation
     joinBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    await sleep(rand(500, 1200));
+    await sleep(rand(600, 1500));
+
+    // Pre-click pause
+    await sleep(rand(400, 1200));
 
     // Click
     joinBtn.click();
-
-    // Wait to confirm the button text changes to "Joined" or "Requested"
     await sleep(rand(2000, 4000));
 
-    const confirmTexts = ['Joined', 'Requested', 'Pending'];
-    const postCheck = document.querySelector(`[role="button"]`);
-    if (postCheck) {
-      const pt = postCheck.textContent.trim();
-      if (confirmTexts.some((t) => pt.includes(t))) {
-        return { success: true, message: 'Community joined successfully.' };
+    // Verify: after clicking, the button text should change to contain
+    // "Joined", "Requested", or "Pending"
+    const confirmTexts = ['joined', 'requested', 'pending', 'leave'];
+    // Re-scan with a shorter timeout
+    const postJoin = await waitForElementAndExecute(() => {
+      const all = document.querySelectorAll('button, [role="button"], span, div[role="button"]');
+      for (const el of all) {
+        const t = (el.textContent || '').trim().toLowerCase();
+        if (confirmTexts.some((ct) => t.includes(ct))) {
+          const clickable = closestClickable(el);
+          if (clickable && clickable.offsetParent !== null) return clickable;
+        }
       }
-    }
+      return null;
+    }, 5000, 500);
 
-    return { success: true, message: 'Join button clicked.' };
+    const confirmed = !!postJoin;
+
+    return {
+      success: true,
+      message: confirmed
+        ? 'Community joined successfully.'
+        : 'Join button clicked (confirmation pending).',
+    };
   }
 
   /**
-   * POST content in a community on the current page.
-   * Finds the textbox, simulates typing, then clicks the Post button.
+   * POST or REPLY content in a community / tweet on the current page.
+   * 1. Find the contenteditable textbox via [contenteditable="true"][role="textbox"]
+   * 2. Simulate human typing character-by-character using execCommand
+   * 3. Find and click the "Post" or "Reply" button
    */
   async function actionPostMessage({ content }) {
     if (!content || content.trim().length === 0) {
       return { success: false, error: 'No content provided to post.' };
     }
 
-    await sleep(rand(2000, 4000));
+    await sleep(rand(1500, 3000));
 
-    // Find the text input — X uses role="textbox" with contenteditable
-    let textbox = await waitForElement(
-      'div[role="textbox"][contenteditable="true"]',
-      12000
+    // Poll for the text input element
+    const textbox = await waitForElementAndExecute(
+      () =>
+        document.querySelector(
+          '[contenteditable="true"][role="textbox"]'
+        ) || document.querySelector('div[contenteditable="true"]'),
+      POLL_TIMEOUT_MS
     );
 
     if (!textbox) {
-      // Fallback: any contenteditable div
-      textbox = await waitForElement('div[contenteditable="true"]', 8000);
+      return { success: false, error: 'Text input field not found after polling.' };
     }
 
-    if (!textbox) {
-      return { success: false, error: 'Text input field not found.' };
-    }
-
-    // Scroll to the textbox
+    // Scroll textbox into view
     textbox.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    await sleep(rand(500, 1000));
+    await sleep(rand(500, 1200));
 
-    // Simulate typing character by character
+    // Simulate typing with the typewriter loop
     await simulateTyping(textbox, content);
 
-    // Short break after typing finishes
+    // Short pause after typing
     await sleep(rand(800, 2000));
 
-    // Find the Post button — exact text "Post" with role="button"
-    let postBtn = await waitForElementByText('button', 'Post', 8000);
+    // Find the confirmation button — "Post" or "Reply"
+    let confirmBtn = await findButtonByText('post', 8000);
 
-    if (!postBtn) {
-      // Try data-testid approach
-      postBtn = await waitForElement(
-        'button[data-testid="tweetButtonInline"]',
-        8000
-      );
+    if (!confirmBtn) {
+      confirmBtn = await findButtonByText('reply', 8000);
     }
 
-    if (!postBtn) {
+    if (!confirmBtn) {
       return {
         success: false,
-        error:
-          'Post button not found. Text was typed but not submitted.',
+        error: 'Post/Reply button not found. Text was typed but not submitted.',
       };
     }
 
-    postBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    confirmBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
     await sleep(rand(500, 1200));
 
-    // Check if button is disabled before clicking
+    // Check if disabled
     if (
-      postBtn.hasAttribute('disabled') ||
-      postBtn.getAttribute('aria-disabled') === 'true'
+      confirmBtn.hasAttribute('disabled') ||
+      confirmBtn.getAttribute('aria-disabled') === 'true' ||
+      confirmBtn.classList.contains('disabled')
     ) {
       return {
         success: false,
-        error: 'Post button is disabled (content may be empty or invalid).',
+        error: 'Post/Reply button is disabled (content may be empty or invalid).',
       };
     }
 
-    postBtn.click();
+    confirmBtn.click();
+    await sleep(rand(2000, 4000));
 
-    await sleep(rand(2000, 3500));
-
-    return { success: true, message: 'Post submitted successfully.' };
+    return { success: true, message: 'Post/Reply submitted successfully.' };
   }
 
   /**
    * FOLLOW accounts on the current Connect People / followers page.
-   * Finds visible "Follow" buttons (excluding accounts already "Following")
-   * and clicks up to `maxFollows` of them.
+   * Finds visible "Follow" buttons (excluding "Following", "Follows you", "Pending")
+   * and clicks up to `maxFollows` of them with randomised delays.
    */
   async function actionFollowBack({ maxFollows = 3 } = {}) {
     await sleep(rand(2000, 4000));
 
-    // Scroll down a bit so more items load
+    // Scroll to trigger lazy loading
     window.scrollBy({ top: rand(300, 800), behavior: 'smooth' });
     await sleep(rand(1000, 2000));
 
-    // Find all Follow buttons — look for buttons with exact text "Follow"
-    // Exclude: "Following" (already following), "Follows you" (mutual), "Pending"
-    const allButtons = document.querySelectorAll(
-      'button, [role="button"]'
-    );
-    const followButtons = [];
+    // Collect all visible Follow buttons
+    const followBtns = [];
 
-    for (const btn of allButtons) {
-      const text = btn.textContent.trim();
-      if (
-        text === 'Follow' &&
-        !btn.hasAttribute('disabled') &&
-        btn.getAttribute('aria-disabled') !== 'true' &&
-        // Ensure it's not inside a disabled context
-        btn.offsetParent !== null
-      ) {
-        followButtons.push(btn);
+    await waitForElementAndExecute(() => {
+      followBtns.length = 0;
+      const candidates = document.querySelectorAll(
+        'button, [role="button"]'
+      );
+      for (const btn of candidates) {
+        const text = (btn.textContent || '').trim();
+        if (
+          text === 'Follow' &&
+          !btn.hasAttribute('disabled') &&
+          btn.getAttribute('aria-disabled') !== 'true' &&
+          btn.offsetParent !== null // visible
+        ) {
+          followBtns.push(btn);
+        }
       }
-    }
+      return followBtns.length > 0 ? followBtns[0] : null;
+    }, 8000);
 
-    if (followButtons.length === 0) {
+    if (followBtns.length === 0) {
       return {
         success: false,
         error: 'No visible Follow buttons found on this page.',
       };
     }
 
-    // Limit to maxFollows
-    const toClick = followButtons.slice(0, maxFollows);
+    const toClick = followBtns.slice(0, Math.min(maxFollows, followBtns.length));
     let clickedCount = 0;
 
     for (const btn of toClick) {
@@ -301,7 +325,7 @@
       btn.click();
       clickedCount++;
 
-      // Random delay between follows
+      // Randomised delay between follows
       await sleep(rand(3000, 6000));
     }
 
@@ -313,33 +337,10 @@
   }
 
   /* ────────────────────────────────────────────────────────────────
-   *  Route Guards — confirm we're on the right page
-   * ──────────────────────────────────────────────────────────────── */
-
-  /**
-   * Check if the current URL is a community page.
-   */
-  function isCommunityPage() {
-    return window.location.href.includes('/i/communities/');
-  }
-
-  /**
-   * Check if the current URL is a connect_people / follow-recommendation page.
-   */
-  function isConnectPeoplePage() {
-    return (
-      window.location.href.includes('/i/connect_people') ||
-      window.location.href.includes('/notifications') ||
-      window.location.href.includes('/followers')
-    );
-  }
-
-  /* ────────────────────────────────────────────────────────────────
    *  Message Listener — bridge from background.js
    * ──────────────────────────────────────────────────────────────── */
 
   chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    // Immediately respond to keep the port open
     const handler = (async () => {
       try {
         switch (request.action) {
@@ -373,11 +374,9 @@
       }
     })();
 
-    // Send response back to background
     handler.then(sendResponse);
     return true; // Keep channel open for async response
   });
 
-  // Signal that content script has loaded
   console.log('[Xpert Engage] content.js injected and ready.');
 })();

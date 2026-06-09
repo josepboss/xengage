@@ -31,3 +31,11 @@
 9. **Anti-suspension delays are mandatory.** All timing constants (`TAB_LOAD_BUFFER_MIN`, `TASK_INTERVAL_MIN`, `humanSleep`) must be defined in one place (`background.js`) and use random variance. Do not hardcode delays.
 
 10. **No try/catch unless specifically requested.** Errors should bubble up so the developer (or AI) can fix them. The only exceptions are `chrome.runtime.sendMessage` calls (popup may be closed) which already have `.catch(() => {})` patterns.
+
+11. **Active DOM polling in content.js.** All element queries against X.com's React UI must use `waitForElementAndExecute(predicate, timeout, pollInterval)` which polls every 500ms for up to 15s. Never query the DOM once — X components mount asynchronously after the DOM reports `readyState === 'complete'`. Always check `offsetParent !== null` to confirm visibility.
+
+12. **Button matching must be broad + resilient.** Use `querySelectorAll('button, [role="button"], a, span, div[role="button"]')` and match `textContent` case-insensitively. For matched inner nodes (e.g. `<span>`), use `.closest('button, [role="button"], a')` to find the actual clickable parent. Always verify the button is not disabled (`hasAttribute('disabled')`, `aria-disabled`, or `classList.contains('disabled')`) before clicking.
+
+13. **Typing must use `document.execCommand('insertText')`.** Do NOT set `element.textContent` for typing — X's React state only listens to `execCommand` + `InputEvent('input')` events. Use a typewriter loop with 50-150ms randomised per-character delays. Re-focus the element and collapse the selection range before each character to keep React's cursor position intact.
+
+14. **Content script messaging must include PING probe + retry.** Before dispatching any command, background.js must PING the content script. If PING fails, inject `content.js` programmatically via `chrome.scripting.executeScript` and wait 800ms for initialisation. The full command send must be wrapped in a retry loop (up to 3 attempts) with exponential backoff, and use `return true` in the `onMessage.addListener` callback to keep the async channel open.
