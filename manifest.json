@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Xpert Engage — X Community Automation",
+  "version": "1.0.0",
+  "description": "Automate X.com community engagement with human-like simulation protocols.",
+  "permissions": [
+    "cookies",
+    "storage",
+    "tabs",
+    "alarms",
+    "notifications",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://x.com/*",
+    "https://*.x.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://x.com/*", "https://*.x.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
