@@ -9,6 +9,12 @@
  * X's dynamic component mounting. Typing uses document.execCommand('insertText')
  * inside a typewriter loop to properly update React's internal input state.
  *
+ * Join matching uses a 4-phase fallback strategy:
+ *   1. Broad text-Contains scan via findButtonByText
+ *   2. Scroll + retry (some X layouts mount buttons after scroll)
+ *   3. Leaf-node scan over ALL elements for "Join" text
+ *   4. Always uses .closest to find the clickable parent for nested spans
+ *
  * Pattern: waitForElementAndExecute → locate element → human delay → act → respond()
  */
 
@@ -51,39 +57,58 @@
   }
 
   /**
-   * Find the closest clickable element for a matched inner node.
-   * Searches up the ancestor chain for button / [role="button"] / a.
+   * Check if an element's visible text content contains `target`
+   * (case-insensitive, partial match). Uses includes() rather than
+   * strict equality to handle extra whitespace, hidden child nodes,
+   * and zero-width characters that X.com often injects.
+   */
+  function textContains(el, target) {
+    if (!el || !el.textContent) return false;
+    const text = el.textContent.trim().toLowerCase();
+    return text.includes(target.toLowerCase());
+  }
+
+  /**
+   * Check if an element is actually visible on screen.
+   * Uses offsetParent (fastest) and falls back to checking
+   * clientRects for edge cases.
+   */
+  function isVisible(el) {
+    if (!el) return false;
+    if (el.offsetParent !== null) return true;
+    // offsetParent can be null for some positioned elements that are still visible
+    return el.getClientRects().length > 0 &&
+           (el.clientWidth > 0 || el.clientHeight > 0);
+  }
+
+  /**
+   * Find the closest clickable ancestor for a matched inner node.
+   * Searches up the ancestor chain. If the element itself is already
+   * clickable (button / [role="button"] / a), returns it directly.
    */
   function closestClickable(el) {
     if (!el) return null;
-    if (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button' || el.tagName === 'A') return el;
-    return el.closest('button, [role="button"], a');
+    const clickableTags = 'button, [role="button"], a, div[role="button"]';
+    if (el.matches && el.matches(clickableTags)) return el;
+    return el.closest(clickableTags);
   }
 
   /**
-   * Match textContent (trimmed) against a string, case-insensitive.
-   */
-  function textMatches(el, target) {
-    if (!el || !el.textContent) return false;
-    return el.textContent.trim().toLowerCase() === target.toLowerCase();
-  }
-
-  /**
-   * Poll for an element whose text matches `target` (case-insensitive),
-   * scanning across button / [role="button"] / span / div elements.
+   * Poll for a clickable element whose visible text contains `target`
+   * (case-insensitive, partial match). Scans across all common
+   * interactive and text-level elements every 500ms for up to `timeout` ms.
+   *
    * Returns the clickable parent node (via closestClickable) or null.
    */
   async function findButtonByText(target, timeout = POLL_TIMEOUT_MS) {
     return waitForElementAndExecute(() => {
-      // Scan all common interactive + text nodes
       const candidates = document.querySelectorAll(
-        'button, [role="button"], a, span, div[role="button"]'
+        'button, [role="button"], a, span, div, label'
       );
       for (const el of candidates) {
-        if (textMatches(el, target)) {
-          const clickable = closestClickable(el);
-          if (clickable && clickable.offsetParent !== null) return clickable;
-        }
+        if (!textContains(el, target)) continue;
+        const clickable = closestClickable(el);
+        if (clickable && isVisible(clickable)) return clickable;
       }
       return null;
     }, timeout);
@@ -151,43 +176,83 @@
 
   /**
    * JOIN a community on the current page.
-   * Actively polls for a clickable element whose textContent matches "join"
-   * (case-insensitive) across all button, [role="button"], span nodes.
-   * Uses .closest('[role="button"]') to find the actual clickable node.
+   *
+   * Multi-phase strategy:
+   *   1. Let page settle (1.5–3s random)
+   *   2. Poll for "Join" button via findButtonByText (up to 15s, every 500ms)
+   *      - Uses textContains (partial match, case-insensitive)
+   *      - Uses closestClickable for nested span layouts
+   *   3. If not found, scroll down slightly and retry (some X layouts
+   *      only mount the button after a scroll-triggered React render)
+   *   4. If still not found, scan ALL leaf-level DOM elements for
+   *      exact "join" text as a last resort
+   *   5. Dispatch mousedown→mouseup→click sequence for React reliability
+   *   6. Verify by polling for confirmation text ("Joined", "Requested", "Pending")
    */
   async function actionJoinCommunity() {
-    // Let page settle after navigation
+    // Phase 1: Let page settle after navigation
     await sleep(rand(1500, 3000));
 
-    // Poll for the Join button (up to 15s)
-    const joinBtn = await findButtonByText('join', POLL_TIMEOUT_MS);
+    // Phase 2: Poll for the Join button (broad textContains, up to 15s)
+    let joinBtn = await findButtonByText('join', POLL_TIMEOUT_MS);
+
+    // Phase 3: Fallback — scroll to trigger lazy React rendering, then retry
+    if (!joinBtn) {
+      window.scrollBy({ top: rand(100, 400), behavior: 'smooth' });
+      await sleep(rand(1000, 2000));
+      joinBtn = await findButtonByText('join', 8000);
+    }
+
+    // Phase 4: Last resort — scan ALL leaf elements for exact/trimmed "Join" text
+    if (!joinBtn) {
+      joinBtn = await waitForElementAndExecute(() => {
+        const all = document.querySelectorAll('*');
+        for (const el of all) {
+          // Only consider leaf nodes (elements with no children or whose
+          // textContent is not just whitespace from children)
+          const text = (el.textContent || '').trim();
+          if (text.length === 0) continue;
+          if (el.children.length > 0 && Array.from(el.children).some(c => c.textContent.trim())) continue;
+
+          const lower = text.toLowerCase();
+          if (lower === 'join' || lower.startsWith('join') || lower === 'join ') {
+            if (!isVisible(el)) continue;
+            const clickable = closestClickable(el) || el;
+            if (clickable && !clickable.hasAttribute('disabled')) return clickable;
+          }
+        }
+        return null;
+      }, 5000);
+    }
 
     if (!joinBtn) {
-      return { success: false, error: 'Join button not found after polling.' };
+      return { success: false, error: 'Join button not found after exhaustive polling.' };
     }
 
     // Scroll into view with human-like hesitation
     joinBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
     await sleep(rand(600, 1500));
-
-    // Pre-click pause
     await sleep(rand(400, 1200));
 
-    // Click
+    // Simulate a real click series (mousedown → mouseup → click)
+    // X's React often responds more reliably to this sequence
+    joinBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+    await sleep(rand(50, 150));
+    joinBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+    await sleep(rand(50, 150));
     joinBtn.click();
+
     await sleep(rand(2000, 4000));
 
-    // Verify: after clicking, the button text should change to contain
-    // "Joined", "Requested", or "Pending"
+    // Phase 6: Verify — poll for confirmation text
     const confirmTexts = ['joined', 'requested', 'pending', 'leave'];
-    // Re-scan with a shorter timeout
     const postJoin = await waitForElementAndExecute(() => {
-      const all = document.querySelectorAll('button, [role="button"], span, div[role="button"]');
+      const all = document.querySelectorAll('button, [role="button"], span, div');
       for (const el of all) {
         const t = (el.textContent || '').trim().toLowerCase();
-        if (confirmTexts.some((ct) => t.includes(ct))) {
+        if (confirmTexts.some((ct) => t.includes(ct)) && isVisible(el)) {
           const clickable = closestClickable(el);
-          if (clickable && clickable.offsetParent !== null) return clickable;
+          if (clickable && isVisible(clickable)) return clickable;
         }
       }
       return null;
@@ -300,7 +365,7 @@
           text === 'Follow' &&
           !btn.hasAttribute('disabled') &&
           btn.getAttribute('aria-disabled') !== 'true' &&
-          btn.offsetParent !== null // visible
+          isVisible(btn)
         ) {
           followBtns.push(btn);
         }
