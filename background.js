@@ -1,15 +1,15 @@
 /**
  * background.js — Task Orchestrator & Session Manager
  *
- * Service worker that orchestrates the automation workflow:
+ * This service worker is the brain of the extension:
  * 1. Injects auth_token cookie to authenticate the X session
- * 2. Builds an interleaved task queue (join, post, follow)
- * 3. Manages a stable automation tab with retry logic
- * 4. Enforces anti-suspension delays (4-7 min between tasks)
+ * 2. Maintains a shuffled, interleaved task queue (join, post, follow)
+ * 3. Enforces anti-suspension delays between every action
+ * 4. Tracks daily caps (max 50 follows/day stored in chrome.storage.local)
  * 5. Streams status updates back to the popup via chrome.runtime messaging
  *
- * Manifest V3 service worker — all mutable state persists in
- * chrome.storage.local for reliability across worker restarts.
+ * Manifest V3 service worker — persists across events but can be killed.
+ * All state is persisted in chrome.storage.local for reliability.
  */
 
 /* ────────────────────────────────────────────────────────────────
@@ -18,16 +18,13 @@
 
 const DAILY_FOLLOW_LIMIT = 50;
 const MICRO_BATCH_SIZE = 3;
+const MICRO_BATCH_SLEEP_MS = 60 * 60 * 1000; // 1 hour
 
 // Anti-suspension timing (ms)
 const TAB_LOAD_BUFFER_MIN = 5000;
 const TAB_LOAD_BUFFER_MAX = 10000;
-const TASK_INTERVAL_MIN = 4 * 60 * 1000; // 4 minutes
-const TASK_INTERVAL_MAX = 7 * 60 * 1000; // 7 minutes
-
-// Messaging
-const TAB_MESSAGE_TIMEOUT_MS = 30000;
-const MAX_SEND_RETRIES = 2;
+const TASK_INTERVAL_MIN = 4 * 60 * 1000; // 4 min
+const TASK_INTERVAL_MAX = 7 * 60 * 1000; // 7 min
 
 /* ────────────────────────────────────────────────────────────────
  *  State (in-memory mirror of chrome.storage.local)
@@ -42,8 +39,7 @@ let state = {
 };
 
 /**
- * Load persisted state from chrome.storage.local and reset daily
- * counter if it's a new calendar day.
+ * Load persisted state from chrome.storage.local.
  */
 async function loadState() {
   const stored = await chrome.storage.local.get([
@@ -59,26 +55,28 @@ async function loadState() {
   if (stored.dailyFollows !== undefined) state.dailyFollows = stored.dailyFollows;
   if (stored.lastResetDate) state.lastResetDate = stored.lastResetDate;
 
-  // Reset daily follow counter if day changed
+  // Reset daily counter if it's a new day
   const today = new Date().toISOString().slice(0, 10);
   if (state.lastResetDate !== today) {
     state.dailyFollows = 0;
     state.lastResetDate = today;
-    await chrome.storage.local.set({ dailyFollows: 0, lastResetDate: today });
+    await chrome.storage.local.set({
+      dailyFollows: 0,
+      lastResetDate: today,
+    });
   }
 }
 
 /**
- * Persist one or more state fields to chrome.storage.local.
+ * Persist critical state fields to storage.
  */
 async function persistState(fields) {
   await chrome.storage.local.set(fields);
 }
 
-/* ────────────────────────────────────────────────────────────────
- *  Logging / Status (broadcast to popup if open)
- * ──────────────────────────────────────────────────────────────── */
-
+/**
+ * Send a log entry to the popup (if open).
+ */
 function logToPopup(level, message) {
   chrome.runtime
     .sendMessage({
@@ -87,9 +85,14 @@ function logToPopup(level, message) {
       message,
       timestamp: Date.now(),
     })
-    .catch(() => {});
+    .catch(() => {
+      /* popup may not be open */
+    });
 }
 
+/**
+ * Send updated stats to the popup.
+ */
 function updatePopupStats() {
   chrome.runtime
     .sendMessage({
@@ -101,6 +104,9 @@ function updatePopupStats() {
     .catch(() => {});
 }
 
+/**
+ * Send the current status string to popup.
+ */
 function setStatus(statusText) {
   chrome.runtime
     .sendMessage({ type: 'STATUS', text: statusText })
@@ -112,24 +118,24 @@ function setStatus(statusText) {
  * ──────────────────────────────────────────────────────────────── */
 
 /**
- * Clear all existing x.com cookies, inject the provided auth_token,
- * then open x.com to let the session take effect.
+ * Clear all existing x.com cookies and inject the provided auth_token.
+ * Then open x.com to let the session take effect.
  */
 async function injectAuthToken(authToken) {
   const domain = '.x.com';
 
-  // Clear all existing x.com cookies
+  // Clear existing cookies for x.com
   const existing = await chrome.cookies.getAll({ domain });
   for (const cookie of existing) {
     await chrome.cookies.remove({
-      url: `https://x.com${cookie.path}`,
+      url: `https://${domain.replace(/^\./, '')}${cookie.path}`,
       name: cookie.name,
     });
   }
 
-  // Inject the auth_token cookie
+  // Inject the new auth_token
   await chrome.cookies.set({
-    url: 'https://x.com',
+    url: `https://${domain.replace(/^\./, '')}`,
     domain,
     name: 'auth_token',
     value: authToken,
@@ -139,9 +145,9 @@ async function injectAuthToken(authToken) {
     sameSite: 'lax',
   });
 
-  // Supplemental cookies to appear more natural
+  // Also set a few additional cookies to mimic a real browser
   await chrome.cookies.set({
-    url: 'https://x.com',
+    url: `https://${domain.replace(/^\./, '')}`,
     domain,
     name: 'lang',
     value: 'en',
@@ -151,7 +157,7 @@ async function injectAuthToken(authToken) {
 
   logToPopup('success', 'Auth token injected successfully.');
 
-  // Open x.com to establish the session (hidden tab)
+  // Open x.com to authenticate
   await chrome.tabs.create({ url: 'https://x.com', active: false });
 
   return { success: true };
@@ -162,13 +168,19 @@ async function injectAuthToken(authToken) {
  * ──────────────────────────────────────────────────────────────── */
 
 /**
- * Build an interleaved task queue from user inputs.
- * Mixes join, post, and follow tasks so similar actions are never
- * performed more than 2 times in a row (organic behaviour).
+ * Build an interleaved (shuffled) task queue from the user's inputs.
+ *
+ * Strategy: Mix join, post, and follow tasks so we never do the same
+ * action type more than 2 times in a row. This mimics organic behaviour.
+ *
+ * @param {string[]} communityUrls
+ * @param {string}   postContent
+ * @param {boolean}  autoFollowEnabled
  */
 function buildQueue(communityUrls, postContent, autoFollowEnabled) {
   const tasks = [];
 
+  // For each community URL, create a join task and (if content provided) a post task
   for (const url of communityUrls) {
     const trimmed = url.trim();
     if (!trimmed) continue;
@@ -181,24 +193,39 @@ function buildQueue(communityUrls, postContent, autoFollowEnabled) {
     }
   }
 
-  // Interleave follow-back sessions
-  if (autoFollowEnabled && tasks.length > 0) {
-    const insertPoints = [
-      Math.floor(tasks.length * 0.25),
-      Math.floor(tasks.length * 0.5),
-      Math.floor(tasks.length * 0.75),
-    ];
+  // Add follow-back tasks interspersed
+  if (autoFollowEnabled) {
+    // Insert follow tasks at multiple points in the queue
+    const followTargets = [3, 2, 3]; // 3 follow sessions, varying sizes
+    let insertAt = Math.max(1, Math.floor(tasks.length / 4));
 
-    for (const point of insertPoints) {
-      const pos = Math.min(point, tasks.length);
-      tasks.splice(pos, 0, {
+    for (const count of followTargets) {
+      const followTask = {
         type: 'NAVIGATE',
         url: 'https://x.com/i/connect_people',
-      });
-      tasks.splice(pos + 1, 0, {
+      };
+      const followAction = {
         type: 'FOLLOW_BACK',
-        maxFollows: MICRO_BATCH_SIZE,
-      });
+        maxFollows: Math.min(count, MICRO_BATCH_SIZE),
+      };
+
+      // Insert at strategic positions to interleave
+      const pos = Math.min(insertAt, tasks.length);
+      tasks.splice(pos, 0, followTask, followAction);
+      insertAt += Math.max(2, Math.floor(tasks.length / 3));
+    }
+  }
+
+  // Final shuffle: swap adjacent tasks of different types to ensure mixing
+  for (let i = 1; i < tasks.length - 1; i += 2) {
+    if (
+      tasks[i].type !== tasks[i - 1].type &&
+      tasks[i].type !== tasks[i + 1]?.type
+    ) {
+      // Already well-mixed
+    } else if (tasks[i + 1]) {
+      // Swap with next
+      [tasks[i], tasks[i + 1]] = [tasks[i + 1], tasks[i]];
     }
   }
 
@@ -206,113 +233,23 @@ function buildQueue(communityUrls, postContent, autoFollowEnabled) {
 }
 
 /* ────────────────────────────────────────────────────────────────
- *  Tab Management
- * ──────────────────────────────────────────────────────────────── */
-
-/**
- * Create a new automation tab (hidden) and return its id.
- * If an existing tabId is provided and still valid, reuse it.
- */
-async function ensureTab(existingTabId) {
-  if (existingTabId) {
-    try {
-      await chrome.tabs.get(existingTabId);
-      return existingTabId;
-    } catch {
-      // Tab was closed — will create a new one below
-    }
-  }
-
-  const tab = await chrome.tabs.create({
-    url: 'https://x.com',
-    active: false,
-  });
-
-  // Wait for initial load
-  await waitForTabComplete(tab.id);
-  return tab.id;
-}
-
-/**
- * Wait for a tab's readyState to reach "complete".
- */
-async function waitForTabComplete(tabId, pollMs = 500, timeoutMs = 30000) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    try {
-      const tab = await chrome.tabs.get(tabId);
-      if (tab.status === 'complete') return;
-    } catch {
-      return;
-    }
-    await sleep(pollMs);
-  }
-}
-
-/* ────────────────────────────────────────────────────────────────
- *  Content Script Messaging (with retry and injection fallback)
- * ──────────────────────────────────────────────────────────────── */
-
-/**
- * Send a message to the content script in tabId.
- * If the content script is not loaded, inject it programmatically.
- * Retries up to MAX_SEND_RETRIES times on failure.
- */
-async function sendToTab(tabId, message, timeoutMs = TAB_MESSAGE_TIMEOUT_MS) {
-  for (let attempt = 0; attempt <= MAX_SEND_RETRIES; attempt++) {
-    try {
-      // Probe: is the content script alive?
-      try {
-        await chrome.tabs.sendMessage(tabId, { action: 'PING' });
-      } catch {
-        // Not loaded — inject it
-        await chrome.scripting.executeScript({
-          target: { tabId },
-          files: ['content.js'],
-        });
-        await sleep(800); // allow initialisation
-      }
-
-      // Send the actual command with timeout
-      const result = await new Promise((resolve, reject) => {
-        const timer = setTimeout(
-          () => reject(new Error('Response timeout')),
-          timeoutMs
-        );
-        chrome.tabs.sendMessage(tabId, message, (response) => {
-          clearTimeout(timer);
-          if (chrome.runtime.lastError) {
-            reject(new Error(chrome.runtime.lastError.message));
-          } else {
-            resolve(response);
-          }
-        });
-      });
-
-      return result;
-    } catch (err) {
-      if (attempt < MAX_SEND_RETRIES) {
-        logToPopup('warn', `Retrying send to tab (attempt ${attempt + 2}/${MAX_SEND_RETRIES + 1})…`);
-        await sleep(1000 + attempt * 500);
-      } else {
-        return { success: false, error: err.message };
-      }
-    }
-  }
-}
-
-/* ────────────────────────────────────────────────────────────────
  *  Task Executor
  * ──────────────────────────────────────────────────────────────── */
 
+/**
+ * Execute a single task item from the queue.
+ * This involves opening a tab, waiting for it to load, and sending a
+ * message to the content script to perform the action.
+ *
+ * @param {object} task
+ * @param {number} tabId
+ */
 async function executeTask(task, tabId) {
   switch (task.type) {
     case 'NAVIGATE': {
-      logToPopup('info', `Navigating to page…`);
-      setStatus('Navigating…');
+      logToPopup('info', `Navigating to community page…`);
+      setStatus('Navigating to community…');
       await chrome.tabs.update(tabId, { url: task.url });
-      await waitForTabComplete(tabId);
-      await humanSleep(TAB_LOAD_BUFFER_MIN, TAB_LOAD_BUFFER_MAX - TAB_LOAD_BUFFER_MIN);
       break;
     }
 
@@ -326,7 +263,10 @@ async function executeTask(task, tabId) {
         state.stats.joined += 1;
         logToPopup('success', `✅ Joined community. (Total: ${state.stats.joined})`);
       } else {
-        logToPopup('warn', `⚠️ Join failed: ${resp?.error || 'No response from tab'}`);
+        logToPopup(
+          'warn',
+          `⚠️ Join failed: ${resp?.error || 'No response from tab'}`
+        );
       }
 
       await persistState({ stats: state.stats });
@@ -347,7 +287,10 @@ async function executeTask(task, tabId) {
         state.stats.posted += 1;
         logToPopup('success', `✅ Post published. (Total: ${state.stats.posted})`);
       } else {
-        logToPopup('warn', `⚠️ Post failed: ${resp?.error || 'No response from tab'}`);
+        logToPopup(
+          'warn',
+          `⚠️ Post failed: ${resp?.error || 'No response from tab'}`
+        );
       }
 
       await persistState({ stats: state.stats });
@@ -356,9 +299,12 @@ async function executeTask(task, tabId) {
     }
 
     case 'FOLLOW_BACK': {
-      // Enforce daily cap
+      // Check daily cap
       if (state.dailyFollows >= DAILY_FOLLOW_LIMIT) {
-        logToPopup('warn', `⚠️ Daily follow cap (${DAILY_FOLLOW_LIMIT}) reached. Skipping.`);
+        logToPopup(
+          'warn',
+          `⚠️ Daily follow cap (${DAILY_FOLLOW_LIMIT}) reached. Skipping follow batch.`
+        );
         return;
       }
 
@@ -378,9 +324,15 @@ async function executeTask(task, tabId) {
       if (resp?.success && resp.followed) {
         state.dailyFollows += resp.followed;
         state.stats.followed += resp.followed;
-        logToPopup('success', `✅ Followed ${resp.followed} account(s). (Daily: ${state.dailyFollows}/${DAILY_FOLLOW_LIMIT})`);
+        logToPopup(
+          'success',
+          `✅ Followed ${resp.followed} account(s). (Daily: ${state.dailyFollows}/${DAILY_FOLLOW_LIMIT})`
+        );
       } else {
-        logToPopup('warn', `⚠️ Follow batch: ${resp?.error || 'No accounts followed.'}`);
+        logToPopup(
+          'warn',
+          `⚠️ Follow batch: ${resp?.error || 'No accounts followed.'}`
+        );
       }
 
       await persistState({
@@ -397,10 +349,61 @@ async function executeTask(task, tabId) {
   }
 }
 
+/**
+ * Send a message to a content script in a specific tab and wait for the response.
+ * Injects the content script if not already loaded.
+ */
+async function sendToTab(tabId, message, timeoutMs = 30000) {
+  try {
+    // First ensure the content script is injected
+    try {
+      await chrome.tabs.sendMessage(tabId, { action: 'PING' });
+    } catch {
+      // Content script not loaded yet — inject it
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ['content.js'],
+      });
+      // Give it a moment to initialise
+      await sleep(500);
+    }
+
+    // Wrap in a promise with timeout
+    const result = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Response timeout')), timeoutMs);
+      chrome.tabs.sendMessage(tabId, message, (response) => {
+        clearTimeout(timer);
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+        } else {
+          resolve(response);
+        }
+      });
+    });
+
+    return result;
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+/**
+ * Human-like sleep: Base Time + Random Variance.
+ * @param {number} baseMs - minimum sleep duration
+ * @param {number} varianceMs - additional random variance
+ */
+function humanSleep(baseMs, varianceMs) {
+  const delay = baseMs + Math.floor(Math.random() * varianceMs);
+  return new Promise((r) => setTimeout(r, delay));
+}
+
 /* ────────────────────────────────────────────────────────────────
  *  Main Workflow Runner
  * ──────────────────────────────────────────────────────────────── */
 
+/**
+ * Process the entire task queue with anti-suspension delays.
+ */
 async function runWorkflow() {
   if (state.queue.length === 0) {
     logToPopup('warn', 'Queue is empty. Nothing to do.');
@@ -417,39 +420,66 @@ async function runWorkflow() {
   setStatus('Starting workflow…');
   logToPopup('info', `🚀 Workflow started. ${state.queue.length} tasks queued.`);
 
-  // Create dedicated automation tab
-  let tabId = await ensureTab(null);
+  // Create a dedicated tab for automation (reuse if possible)
+  let tab = await chrome.tabs.create({
+    url: 'https://x.com',
+    active: false,
+  });
+
+  let consecutiveFailures = 0;
 
   for (let i = 0; i < state.queue.length && state.running; i++) {
     const task = state.queue[i];
 
+    // Log current position
     logToPopup(
       'muted',
       `[${i + 1}/${state.queue.length}] Processing: ${task.type}${task.url ? ' → ' + task.url.slice(0, 60) : ''}`
     );
     setStatus(`Task ${i + 1} of ${state.queue.length}: ${formatTaskType(task.type)}…`);
 
-    // Ensure the tab is still alive before each task
-    tabId = await ensureTab(tabId);
-
-    // For non-navigate tasks, let the page settle before acting
-    if (task.type !== 'NAVIGATE') {
+    // Wait for the tab to be fully loaded before interacting
+    if (task.type === 'NAVIGATE') {
+      // Already navigating — wait for load
+      await waitForTabComplete(tab.id);
+      await humanSleep(TAB_LOAD_BUFFER_MIN, TAB_LOAD_BUFFER_MAX - TAB_LOAD_BUFFER_MIN);
+    } else {
+      // Non-navigate tasks also need the page settled
       await humanSleep(TAB_LOAD_BUFFER_MIN, TAB_LOAD_BUFFER_MAX - TAB_LOAD_BUFFER_MIN);
     }
 
+    // Check if the tab is still valid
+    try {
+      await chrome.tabs.get(tab.id);
+    } catch {
+      // Tab was closed — recreate it
+      tab = await chrome.tabs.create({
+        url: 'https://x.com',
+        active: false,
+      });
+      await waitForTabComplete(tab.id);
+    }
+
     // Execute the task
-    await executeTask(task, tabId);
+    await executeTask(task, tab.id);
+
+    // Check if the result was a failure and track consecutive failures
+    // (We don't have the result here directly, but we can infer from logging)
+    consecutiveFailures++;
 
     // ---- ANTI-SUSPENSION: Long pause between major tasks ----
     if (i < state.queue.length - 1 && state.running) {
       const pauseMs =
         TASK_INTERVAL_MIN +
         Math.floor(Math.random() * (TASK_INTERVAL_MAX - TASK_INTERVAL_MIN));
-      const totalSeconds = Math.round(pauseMs / 1000);
-      const minutes = Math.floor(totalSeconds / 60);
-      const seconds = totalSeconds % 60;
+      const pauseSeconds = Math.round(pauseMs / 1000);
+      const minutes = Math.floor(pauseSeconds / 60);
+      const seconds = pauseSeconds % 60;
 
-      logToPopup('muted', `💤 Sleeping ${minutes}m ${seconds}s before next action…`);
+      logToPopup(
+        'muted',
+        `💤 Sleeping ${minutes}m ${seconds}s before next action…`
+      );
       setStatus(`Sleeping ${minutes}m ${seconds}s before next action…`);
 
       await sleep(pauseMs);
@@ -461,9 +491,9 @@ async function runWorkflow() {
   await persistState({ running: false });
   updatePopupStats();
 
-  // Close the automation tab gracefully
+  // Close the automation tab
   try {
-    await chrome.tabs.remove(tabId);
+    await chrome.tabs.remove(tab.id);
   } catch {}
 
   logToPopup(
@@ -473,6 +503,25 @@ async function runWorkflow() {
   setStatus('Completed');
 }
 
+/**
+ * Wait for a tab to reach "complete" readyState.
+ */
+async function waitForTabComplete(tabId, pollMs = 500, timeoutMs = 30000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.status === 'complete') return;
+    } catch {
+      return; // Tab no longer exists
+    }
+    await sleep(pollMs);
+  }
+}
+
+/**
+ * Format task type for display.
+ */
 function formatTaskType(type) {
   switch (type) {
     case 'NAVIGATE':
@@ -489,21 +538,11 @@ function formatTaskType(type) {
 }
 
 /* ────────────────────────────────────────────────────────────────
- *  Sleep helpers
+ *  Sleep helper (for service worker which may not have setTimeout)
  * ──────────────────────────────────────────────────────────────── */
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
-}
-
-/**
- * Human-like sleep with random variance.
- * @param {number} baseMs
- * @param {number} varianceMs
- */
-function humanSleep(baseMs, varianceMs) {
-  const delay = baseMs + Math.floor(Math.random() * varianceMs);
-  return new Promise((r) => setTimeout(r, delay));
 }
 
 /* ────────────────────────────────────────────────────────────────
@@ -528,6 +567,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             return;
           }
 
+          // Build the queue from provided data
           const urls = (request.communityUrls || '')
             .split('\n')
             .map((u) => u.trim())
@@ -541,18 +581,22 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             return;
           }
 
-          state.queue = buildQueue(urls, request.postContent || '', request.autoFollow || false);
+          state.queue = buildQueue(
+            urls,
+            request.postContent || '',
+            request.autoFollow || false
+          );
 
           if (state.queue.length === 0) {
             sendResponse({ success: false, error: 'No tasks could be built from your inputs.' });
             return;
           }
 
-          // Reset stats for a fresh run
+          // Reset stats for fresh run
           state.stats = { joined: 0, posted: 0, followed: 0 };
           await persistState({ stats: state.stats, queue: state.queue });
 
-          // Fire-and-forget the workflow (continues running after sendResponse)
+          // Fire and forget — run in background
           runWorkflow();
 
           sendResponse({ success: true, taskCount: state.queue.length });
@@ -601,7 +645,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
   })();
 
-  return true; // Keep the messaging channel open for async responses
+  return true; // Keep channel open
 });
 
 /* ────────────────────────────────────────────────────────────────
@@ -613,6 +657,7 @@ loadState().then(() => {
   logToPopup('info', 'Background service worker ready.');
 });
 
+// Handle extension install / update
 chrome.runtime.onInstalled.addListener((details) => {
   if (details.reason === 'install') {
     logToPopup('info', 'Thanks for installing Xpert Engage! Open the popup to get started.');

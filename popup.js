@@ -37,7 +37,7 @@
    *  State
    * ──────────────────────────────────────────────────────────────── */
 
-  let logEntries = [];
+  let logEntries = []; // Most recent at end
   let isRunning = false;
 
   /* ────────────────────────────────────────────────────────────────
@@ -55,7 +55,7 @@
     }
   );
 
-  // Persist input changes back to storage
+  // Sync stored state when inputs change
   authTokenInput.addEventListener('input', () =>
     chrome.storage.local.set({ authToken: authTokenInput.value })
   );
@@ -73,7 +73,9 @@
    *  Logging
    * ──────────────────────────────────────────────────────────────── */
 
-  /** Append a message to the on-screen log. */
+  /**
+   * Append a message to the on-screen log.
+   */
   function appendLog(level, message, timestamp) {
     const time = timestamp
       ? new Date(timestamp).toLocaleTimeString()
@@ -83,7 +85,7 @@
 
     const entry = document.createElement('div');
     entry.className = `log-entry ${level}`;
-    entry.innerHTML = `<span class="log-time">${escapeHtml(time)}</span>${escapeHtml(message)}`;
+    entry.innerHTML = `<span class="log-time">${time}</span>${escapeHtml(message)}`;
     logArea.appendChild(entry);
     logArea.scrollTop = logArea.scrollHeight;
 
@@ -96,7 +98,9 @@
     return div.innerHTML;
   }
 
-  /** Clear the on-screen log. */
+  /**
+   * Clear the log.
+   */
   function clearLog() {
     logEntries = [];
     logArea.innerHTML = '';
@@ -124,7 +128,7 @@
   }
 
   /* ────────────────────────────────────────────────────────────────
-   *  Message Listener (from background.js)
+   *  Message Listeners (from background.js)
    * ──────────────────────────────────────────────────────────────── */
 
   chrome.runtime.onMessage.addListener((msg) => {
@@ -140,6 +144,7 @@
         break;
 
       case 'STATUS':
+        // Show the status text subtly — we'll append to log if not already
         statusBadge.textContent = isRunning ? msg.text || 'Running' : 'Idle';
         break;
 
@@ -170,7 +175,7 @@
       });
 
       if (resp?.success) {
-        appendLog('success', '✅ Auth token injected. Opening X…');
+        appendLog('success', `✅ Auth token injected. Opening X…`);
       } else {
         appendLog('error', `❌ Token injection failed: ${resp?.error || 'Unknown error'}`);
       }
@@ -269,6 +274,7 @@
     }
   });
 
+  // Initial log entry
   appendLog('info', 'Xpert Engage ready. Configure your settings and start.');
 
   console.log('[Xpert Engage] popup.js loaded.');
