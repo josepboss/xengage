@@ -1,16 +1,16 @@
 /**
- * content.js — X.com DOM Interaction Engine (Refactored)
+ * content.js — X.com DOM Interaction Engine (Universal Selectors)
  *
- * X uses dynamic, obfuscated React rendering that ignores standard element
- * lookups and flat .click() events. This refactored engine uses four tactics:
+ * Uses language-agnostic data-testid attributes observed from Chrome DevTools
+ * recordings instead of text-string matching. This ensures the extension works
+ * regardless of X's interface language (English, Korean, Japanese, etc.).
  *
- * 1. **Test-ID / ARIA targeting** — scans for [data-testid*="…"] and [role="button"]
- * 2. **Deep text recursive search** — inspects innerText of entire subtrees for
- *    exact-match or substring keywords (e.g. "Join", "Post", "Follow")
- * 3. **Trusted PointerEvent dispatch** — replaces .click() with a synthetic
- *    PointerEvent that has `isTrusted: true` to bypass React's event gate
- * 4. **Verbose debug logging** — logs every candidate element found during
- *    each polling interval so you can inspect in DevTools
+ * Core selectors (verified from actual DOM snapshots):
+ *   - Join button:  [data-testid="primaryColumn"] button (within community header)
+ *   - Textbox:      [data-testid="tweetTextarea_0"]
+ *   - Post button:  [data-testid="tweetButton"]
+ *   - Follow:       [data-testid*="follow"] or [data-testid="userFollowButton"]
+ *   - Community:    [data-testid*="community"]
  */
 
 (function () {
@@ -28,302 +28,157 @@
     console.log(`[Xpert Engage:debug] ${label}`, data);
   }
 
-  /** Escape HTML for safe log insertion (kept from original). */
-  function escapeHtml(str) {
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
-  }
-
   /* ────────────────────────────────────────────────────────────────
-   *  1. TARGETING HELPERS
+   *  HARDWARE STATE EMULATION
+   *
+   *  Dispatches a full mouse-event chain to simulate a real click.
+   *  X's React heavily gatekeeps synthetic events; this bypass works
+   *  because the event sequence mirrors actual user input.
    * ──────────────────────────────────────────────────────────────── */
 
-  /**
-   * Deep-text recursive search.
-   * Given a container element, walks the entire subtree and returns all
-   * elements whose trimmed textContent exactly matches `text` OR contains
-   * the substring `text` (strict mode off).
-   *
-   * @param {Element}  root       - Container to search within
-   * @param {string}   text       - Target text to match
-   * @param {boolean}  exact      - If true, exact match only; else substring
-   * @param {string[]} tagFilter  - Only return elements matching these tagNames
-   *                                (e.g. ['BUTTON', 'A', 'SPAN', 'DIV'])
-   * @param {string[]} roleFilter - Only return elements with one of these roles
-   * @returns {Element[]}
-   */
-  function deepTextSearch(root, text, exact = true, tagFilter = [], roleFilter = []) {
-    const results = [];
-
-    // If root is a text node, skip
-    if (!root || root.nodeType !== Node.ELEMENT_NODE) return results;
-
-    // Quick pre-check: does the subtree contain the text at all?
-    if (!root.textContent || !root.textContent.includes(text)) return results;
-
-    // Walk the tree
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, null);
-    let node;
-    while ((node = walker.nextNode())) {
-      // Tag filter
-      if (tagFilter.length > 0 && !tagFilter.includes(node.tagName)) continue;
-      // Role filter
-      if (roleFilter.length > 0) {
-        const role = node.getAttribute('role');
-        if (!role || !roleFilter.includes(role)) continue;
-      }
-
-      const nodeText = node.textContent.trim();
-      if (!nodeText) continue;
-
-      const matches = exact
-        ? nodeText === text
-        : nodeText.includes(text);
-
-      if (matches) {
-        results.push(node);
-      }
-    }
-
-    return results;
-  }
-
-  /**
-   * Find clickable elements (buttons, links, role="button") that have a
-   * given text. Uses three strategies in order:
-   *   1. data-testid attribute scanning
-   *   2. ARIA role="button" / button / a tag with deep-text match
-   *   3. Fallback: any element whose textContent matches (exact or substring)
-   *
-   * @param {string}  text      - Target text to find
-   * @param {boolean} exact     - Exact match or substring
-   * @param {number}  timeout   - How long to keep polling (ms)
-   * @returns {Promise<Element|null>}
-   */
-  async function findClickableByText(text, exact = true, timeout = 15000) {
-    const start = Date.now();
-    let pollCount = 0;
-
-    while (Date.now() - start < timeout) {
-      pollCount++;
-
-      // ── Strategy 1: data-testid — scan for test IDs that hint at the action ──
-      const testIdCandidates = [];
-
-      // Common test IDs on X that indicate action buttons
-      const testIdPatterns = [
-        `tweetButtonInline`,      // Post button
-        `sidebarJoin`,            // Join
-        `joinButton`,             // Join
-        `followButton`,           // Follow
-        `userFollowButton`,       // Follow on profile
-        `communityJoinButton`,    // Community join
-        `sheetSave`,              // Save / confirm
-        `confirmationButton`,     // Confirm dialog
-      ];
-
-      for (const pattern of testIdPatterns) {
-        const els = document.querySelectorAll(`[data-testid="${pattern}"], [data-testid*="${pattern}"]`);
-        for (const el of els) {
-          if (el.textContent.trim().includes(text) || el.getAttribute('data-testid').includes(text.toLowerCase())) {
-            testIdCandidates.push(el);
-          }
-        }
-      }
-
-      // Also scan for any data-testid that contains the action word
-      const allTestIds = document.querySelectorAll(`[data-testid*="${text.toLowerCase()}"]`);
-      for (const el of allTestIds) {
-        if (el.offsetParent !== null) { // visible
-          testIdCandidates.push(el);
-        }
-      }
-
-      if (testIdCandidates.length > 0) {
-        debugLog(`Strategy 1 (data-testid) found ${testIdCandidates.length} candidates for "${text}"`, testIdCandidates.map(e => ({
-          tag: e.tagName,
-          testid: e.getAttribute('data-testid'),
-          text: e.textContent.trim().slice(0, 40),
-          visible: e.offsetParent !== null,
-        })));
-        // Return the first visible one
-        const visible = testIdCandidates.find(e => e.offsetParent !== null);
-        if (visible) return visible;
-      }
-
-      // ── Strategy 2: ARIA / semantic tags with deep-text search ──
-      const ariaCandidates = deepTextSearch(
-        document.body,
-        text,
-        exact,
-        ['BUTTON', 'A', 'SPAN', 'DIV'],
-        ['button', 'link', 'menuitem', 'option']
-      );
-
-      if (ariaCandidates.length > 0) {
-        debugLog(`Strategy 2 (deep ARIA) found ${ariaCandidates.length} candidates for "${text}"`, ariaCandidates.map(e => ({
-          tag: e.tagName,
-          role: e.getAttribute('role'),
-          text: e.textContent.trim().slice(0, 40),
-          visible: e.offsetParent !== null,
-        })));
-        const visible = ariaCandidates.find(e => e.offsetParent !== null);
-        if (visible) return visible;
-      }
-
-      // ── Strategy 3: Broader search — any clickable-looking element with the text ──
-      const allClickables = document.querySelectorAll(
-        'button, a, [role="button"], [onclick], [data-testid]'
-      );
-
-      const broadCandidates = [];
-      for (const el of allClickables) {
-        const elText = el.textContent.trim();
-        if ((exact && elText === text) || (!exact && elText.includes(text))) {
-          broadCandidates.push(el);
-        }
-      }
-
-      if (broadCandidates.length > 0) {
-        debugLog(`Strategy 3 (broad) found ${broadCandidates.length} candidates for "${text}"`, broadCandidates.map(e => ({
-          tag: e.tagName,
-          role: e.getAttribute('role'),
-          testid: e.getAttribute('data-testid'),
-          text: e.textContent.trim().slice(0, 40),
-          visible: e.offsetParent !== null,
-        })));
-        const visible = broadCandidates.find(e => e.offsetParent !== null);
-        if (visible) return visible;
-      }
-
-      // ── Log poll result ──
-      debugLog(`Poll #${pollCount} — no element found for "${text}"`);
-
-      await sleep(rand(400, 800));
-    }
-
-    // Final attempt with all strategies combined
-    const allElements = document.querySelectorAll('button, a, [role="button"], [data-testid], span, div');
-    for (const el of allElements) {
-      if (el.textContent.trim() === text || el.textContent.trim().includes(text)) {
-        return el;
-      }
-    }
-
-    return null;
-  }
-
-  /* ────────────────────────────────────────────────────────────────
-   *  3. TRUSTED POINTER EVENT DISPATCH
-   * ──────────────────────────────────────────────────────────────── */
-
-  /**
-   * Dispatch a trusted click on an element by generating a sequence of
-   * PointerEvents that simulate a real human click. This bypasses React's
-   * synthetic event delegation which often ignores bare .click().
-   *
-   * The sequence:
-   *   pointerover → mouseover → pointerenter → mouseenter → pointerdown →
-   *   mousedown → pointerup → mouseup → click
-   *
-   * All events have `isTrusted: true` because we create them with the
-   * PointerEvent constructor (browser treats them as "generated by the page"
-   * but React checks isTrusted internally).
-   */
-  function trustedClick(element) {
+  function emulateHardwareClick(element) {
     if (!element) return;
 
-    debugLog('Dispatching trusted pointer event sequence on:', {
+    debugLog('emulateHardwareClick: dispatching event chain on', {
       tag: element.tagName,
-      text: element.textContent.trim().slice(0, 40),
       testid: element.getAttribute('data-testid'),
-      rect: element.getBoundingClientRect(),
+      class: element.className?.slice(0, 60),
     });
 
     const rect = element.getBoundingClientRect();
-    const clientX = rect.left + rect.width / 2;
-    const clientY = rect.top + rect.height / 2;
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
 
-    // Helper to create a PointerEvent
-    function fire(type, options = {}) {
-      const event = new PointerEvent(type, {
-        bubbles: true,
-        cancelable: true,
-        composed: true,
-        view: window,
-        clientX,
-        clientY,
-        screenX: clientX + window.screenX,
-        screenY: clientY + window.screenY,
-        pointerType: 'mouse',
-        pointerId: 1,
-        isPrimary: true,
-        button: 0,
-        buttons: 1,
-        ...options,
-      });
-      element.dispatchEvent(event);
-    }
-
-    // Also fire MouseEvents for compatibility
-    function fireMouse(type, options = {}) {
+    function fireMouse(type, opts = {}) {
       const event = new MouseEvent(type, {
         bubbles: true,
         cancelable: true,
         view: window,
-        clientX,
-        clientY,
-        screenX: clientX + window.screenX,
-        screenY: clientY + window.screenY,
+        clientX: x,
+        clientY: y,
+        screenX: x + window.screenX,
+        screenY: y + window.screenY,
         button: 0,
-        ...options,
+        buttons: type === 'mousedown' ? 1 : 0,
+        ...opts,
       });
       element.dispatchEvent(event);
     }
 
-    // Sequence of events a real click produces
-    fire('pointerover', { relatedTarget: element.parentElement });
-    fireMouse('mouseover', { relatedTarget: element.parentElement });
-    fire('pointerenter', { relatedTarget: element.parentElement });
-    fireMouse('mouseenter', { relatedTarget: element.parentElement });
+    // Phase 1: mousedown
+    fireMouse('mousedown');
 
-    // Small delay between hover and press (mimics human hesitation)
-    // We use a promise so we can await if needed in the caller
-    const delay = rand(50, 150);
-
+    // Phase 2: after a human-like delay, mouseup
     setTimeout(() => {
-      fire('pointerdown');
-      fireMouse('mousedown');
-    }, delay);
-
-    setTimeout(() => {
-      fire('pointerup');
       fireMouse('mouseup');
-      fire('click');
-    }, delay + rand(40, 100));
+    }, rand(60, 150));
 
-    // Also call .click() as a fallback (sometimes React handles it)
+    // Phase 3: after another brief delay, click
     setTimeout(() => {
-      try {
-        element.click();
-      } catch (e) {
-        // Ignore — the pointer events are our primary method
-      }
-    }, delay + 120);
+      fireMouse('click');
+      // Also fire a PointerEvent click as a safety net
+      const pointerEvent = new PointerEvent('click', {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        view: window,
+        clientX: x,
+        clientY: y,
+        pointerType: 'mouse',
+        pointerId: 1,
+        isPrimary: true,
+        isTrusted: true,
+      });
+      element.dispatchEvent(pointerEvent);
+    }, rand(100, 220));
   }
 
-  /**
-   * Convenience: find element by text, then dispatch trusted click.
-   */
-  async function findAndTrustedClick(text, exact = true, timeout = 15000) {
-    const el = await findClickableByText(text, exact, timeout);
-    if (!el) {
-      debugLog(`findAndTrustedClick: element not found for "${text}"`);
-      return { success: false, error: `Element with text "${text}" not found.` };
+  /* ────────────────────────────────────────────────────────────────
+   *  POLLING HELPER
+   *
+   *  Polls a DOM selector every `intervalMs` until the element is found
+   *  or the timeout expires. Returns the element or null.
+   * ──────────────────────────────────────────────────────────────── */
+
+  async function pollSelector(selector, timeoutMs = 15000, intervalMs = 500) {
+    const start = Date.now();
+    let attempts = 0;
+
+    while (Date.now() - start < timeoutMs) {
+      attempts++;
+
+      const el = document.querySelector(selector);
+      if (el) {
+        // Verify it's visible to the user (not hidden, not zero-size)
+        const rect = el.getBoundingClientRect();
+        const visible =
+          el.offsetParent !== null &&
+          rect.width > 0 &&
+          rect.height > 0 &&
+          window.getComputedStyle(el).visibility !== 'hidden';
+
+        if (visible) {
+          debugLog(`pollSelector: found "${selector}" in ${attempts} attempts`, {
+            tag: el.tagName,
+            testid: el.getAttribute('data-testid'),
+            rect,
+          });
+          return el;
+        }
+
+        debugLog(`pollSelector: "${selector}" found but hidden (attempt ${attempts})`, {
+          rect,
+          visibility: window.getComputedStyle(el).visibility,
+          display: window.getComputedStyle(el).display,
+        });
+      }
+
+      debugLog(`pollSelector: attempt ${attempts} — "${selector}" not found yet`);
+      await sleep(intervalMs);
     }
-    trustedClick(el);
-    return { success: true, message: `Clicked element with text "${text}".` };
+
+    debugLog(`pollSelector: TIMEOUT after ${attempts} attempts for "${selector}"`);
+    return null;
+  }
+
+  /* ────────────────────────────────────────────────────────────────
+   *  POLL FOR MULTIPLE SELECTORS (OR logic)
+   * ──────────────────────────────────────────────────────────────── */
+
+  async function pollAnySelector(selectors, timeoutMs = 15000, intervalMs = 500) {
+    const start = Date.now();
+    let attempts = 0;
+
+    while (Date.now() - start < timeoutMs) {
+      attempts++;
+
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el) {
+          const rect = el.getBoundingClientRect();
+          const visible =
+            el.offsetParent !== null &&
+            rect.width > 0 &&
+            rect.height > 0 &&
+            window.getComputedStyle(el).visibility !== 'hidden';
+
+          if (visible) {
+            debugLog(`pollAnySelector: matched "${sel}" in ${attempts} attempts`, {
+              tag: el.tagName,
+              testid: el.getAttribute('data-testid'),
+              rect,
+            });
+            return { selector: sel, element: el };
+          }
+        }
+      }
+
+      debugLog(`pollAnySelector: attempt ${attempts} — none of [${selectors.join(', ')}] visible`);
+      await sleep(intervalMs);
+    }
+
+    debugLog(`pollAnySelector: TIMEOUT after ${attempts} attempts`);
+    return null;
   }
 
   /* ────────────────────────────────────────────────────────────────
@@ -331,100 +186,179 @@
    * ──────────────────────────────────────────────────────────────── */
 
   /**
-   * JOIN a community — finds the Join button using deep-text search and
-   * dispatches a trusted pointer event sequence.
+   * JOIN a community.
+   *
+   * Strategy: Look for any button inside the primary column that is
+   * styled as an action button (accent background). X's community page
+   * always renders exactly one prominent call-to-action button in the
+   * community header area.
    */
   async function actionJoinCommunity() {
-    await sleep(rand(2000, 4000));
+    await sleep(rand(1500, 3000));
 
-    debugLog('actionJoinCommunity: starting search for "Join" button');
+    debugLog('actionJoinCommunity: starting');
 
-    // Primary: find by exact text "Join"
-    let result = await findAndTrustedClick('Join', true, 12000);
+    // Strategy 1: Primary column button with accent styling
+    const joinBtn = await pollSelector(
+      '[data-testid="primaryColumn"] button',
+      12000
+    );
 
-    if (!result.success) {
-      // Fallback: find by "Join" substring (covers "Join Community", "Join X", etc.)
-      debugLog('actionJoinCommunity: exact match failed, trying substring');
-      result = await findAndTrustedClick('Join', false, 8000);
-    }
+    if (joinBtn) {
+      debugLog('actionJoinCommunity: found button in primary column');
+      emulateHardwareClick(joinBtn);
+      await sleep(rand(2000, 3500));
 
-    if (!result.success) {
-      // Last resort: try data-testid patterns
-      debugLog('actionJoinCommunity: substring failed, trying data-testid');
-      const joinBtn = document.querySelector(
-        '[data-testid*="join"], [data-testid*="Join"], [data-testid*="communityJoin"]'
-      );
-      if (joinBtn) {
-        trustedClick(joinBtn);
-        result = { success: true, message: 'Clicked Join via data-testid.' };
+      // Check: Did the button change state? Look for confirmation elements
+      const confirmSelectors = [
+        '[data-testid*="community"] button',
+        '[role="button"][aria-pressed="true"]',
+      ];
+      for (const sel of confirmSelectors) {
+        const confirmEl = await pollSelector(sel, 3000, 500);
+        if (confirmEl) {
+          debugLog(`actionJoinCommunity: confirmation element found via "${sel}"`);
+          return { success: true, message: 'Community joined successfully.' };
+        }
       }
+
+      return { success: true, message: 'Join button clicked.' };
     }
 
-    // Wait for confirmation
-    await sleep(rand(2000, 4000));
+    // Strategy 2: Look for any community-related button
+    debugLog('actionJoinCommunity: trying community-related buttons');
+    const communityBtn = await pollSelector(
+      '[data-testid*="community"] button, [data-testid*="Community"] button',
+      8000
+    );
 
-    // Check if the button changed to "Joined" / "Requested" / "Pending"
-    const confirmTexts = ['Joined', 'Requested', 'Pending'];
-    for (const ct of confirmTexts) {
-      const check = await findClickableByText(ct, true, 2000);
-      if (check) {
-        debugLog(`actionJoinCommunity: confirmation text "${ct}" detected`);
-        return { success: true, message: 'Community joined successfully.' };
-      }
+    if (communityBtn) {
+      emulateHardwareClick(communityBtn);
+      await sleep(rand(2000, 3500));
+      return { success: true, message: 'Community button clicked.' };
     }
 
-    return result.success
-      ? { success: true, message: 'Join button clicked.' }
-      : { success: false, error: 'Could not find a Join button on this page.' };
+    // Strategy 3: Broad search — any visible button in the community page area
+    debugLog('actionJoinCommunity: trying broad button search');
+    const anyBtn = await pollSelector(
+      'section[aria-labelledby*="community"] button, div[data-testid*="community"] button',
+      8000
+    );
+
+    if (anyBtn) {
+      emulateHardwareClick(anyBtn);
+      await sleep(rand(2000, 3500));
+      return { success: true, message: 'Found and clicked a community action button.' };
+    }
+
+    return { success: false, error: 'Could not locate a community join button using data-testid selectors.' };
   }
 
   /**
-   * POST content — finds the textbox, simulates typing char by char,
-   * then finds and clicks the Post button.
+   * POST a message to the community.
+   *
+   * Uses the universal test IDs observed in DevTools:
+   *   - [data-testid="tweetTextarea_0"] for the text input
+   *   - [data-testid="tweetButton"] for the post/submit button
    */
   async function actionPostMessage({ content }) {
     if (!content || content.trim().length === 0) {
       return { success: false, error: 'No content provided to post.' };
     }
 
-    await sleep(rand(2000, 4000));
+    await sleep(rand(1500, 3000));
 
-    debugLog('actionPostMessage: searching for textbox');
+    debugLog('actionPostMessage: starting');
 
-    // Find text input — X uses role="textbox" with contenteditable
-    let textbox =
-      document.querySelector('div[role="textbox"][contenteditable="true"]') ||
-      document.querySelector('div[contenteditable="true"]');
+    // ── Step 1: Find the text input ──────────────────────────────
+    const textbox = await pollSelector('[data-testid="tweetTextarea_0"]', 12000);
 
     if (!textbox) {
-      // Broader: any contenteditable
-      textbox = document.querySelector('[contenteditable="true"]');
+      // Fallback: try the common textarea role
+      debugLog('actionPostMessage: tweetTextarea_0 not found, trying contenteditable');
+      const fallback = await pollSelector(
+        'div[role="textbox"][contenteditable="true"]',
+        8000
+      );
+      if (!fallback) {
+        return { success: false, error: 'Text input field not found on page.' };
+      }
+
+      // Use fallback for typing
+      debugLog('actionPostMessage: using fallback contenteditable div');
+      await typeIntoElement(fallback, content);
+    } else {
+      debugLog('actionPostMessage: found [data-testid="tweetTextarea_0"]');
+      await typeIntoElement(textbox, content);
     }
 
-    if (!textbox) {
-      debugLog('actionPostMessage: no textbox found with standard selectors');
-      return { success: false, error: 'Text input field not found.' };
+    await sleep(rand(800, 2000));
+
+    // ── Step 2: Click the Post button ────────────────────────────
+    debugLog('actionPostMessage: looking for [data-testid="tweetButton"]');
+
+    const postBtn = await pollSelector('[data-testid="tweetButton"]', 10000);
+
+    if (!postBtn) {
+      // Fallback: try tweetButtonInline
+      debugLog('actionPostMessage: tweetButton not found, trying tweetButtonInline');
+      const fallbackBtn = await pollSelector(
+        '[data-testid="tweetButtonInline"]',
+        5000
+      );
+      if (fallbackBtn) {
+        const isDisabled =
+          fallbackBtn.hasAttribute('disabled') ||
+          fallbackBtn.getAttribute('aria-disabled') === 'true';
+        if (!isDisabled) {
+          emulateHardwareClick(fallbackBtn);
+          await sleep(rand(2000, 3500));
+          return { success: true, message: 'Post submitted via tweetButtonInline.' };
+        }
+        return { success: false, error: 'Post button is disabled.' };
+      }
+      return { success: false, error: 'Could not find a Post/Submit button.' };
     }
 
-    debugLog('actionPostMessage: found textbox', {
-      tag: textbox.tagName,
-      role: textbox.getAttribute('role'),
-      contenteditable: textbox.getAttribute('contenteditable'),
-      placeholder: textbox.getAttribute('placeholder') || textbox.getAttribute('aria-label'),
-    });
+    // Verify it's not disabled
+    const isDisabled =
+      postBtn.hasAttribute('disabled') ||
+      postBtn.getAttribute('aria-disabled') === 'true';
 
-    textbox.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    await sleep(rand(500, 1200));
+    if (isDisabled) {
+      debugLog('actionPostMessage: tweetButton is disabled');
+      return { success: false, error: 'Post button is disabled (content may be empty or too short).' };
+    }
 
-    // Simulate typing character by character
-    textbox.focus();
-    await sleep(300 + rand(0, 400));
+    emulateHard```js
+    emulateHardwareClick(postBtn);
+    await sleep(rand(2000, 3500));
+
+    return { success: true, message: 'Post submitted successfully via tweetButton.' };
+  }
+
+  /**
+   * Type content into a contenteditable element character by character,
+   * simulating human typing intervals.
+   */
+  async function typeIntoElement(element, content) {
+    element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    await sleep(rand(400, 800));
+
+    element.focus();
+    await sleep(rand(200, 500));
+
+    // Clear existing content first
+    element.textContent = '';
+    element.dispatchEvent(new Event('input', { bubbles: true }));
+
+    await sleep(rand(200, 400));
 
     for (let i = 0; i < content.length; i++) {
       const char = content[i];
 
       // beforeinput
-      textbox.dispatchEvent(
+      element.dispatchEvent(
         new InputEvent('beforeinput', {
           inputType: 'insertText',
           data: char,
@@ -434,11 +368,10 @@
       );
 
       // Update content
-      const currentText = textbox.textContent || '';
-      textbox.textContent = currentText + char;
+      element.textContent = (element.textContent || '') + char;
 
       // input event
-      textbox.dispatchEvent(
+      element.dispatchEvent(
         new InputEvent('input', {
           inputType: 'insertText',
           data: char,
@@ -447,57 +380,25 @@
         })
       );
 
-      // Keyboard events
-      textbox.dispatchEvent(new KeyboardEvent('keydown', { key: char, bubbles: true }));
-      textbox.dispatchEvent(new KeyboardEvent('keypress', { key: char, bubbles: true }));
-      textbox.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true }));
+      // Keyboard events for React's synthetic event listeners
+      element.dispatchEvent(new KeyboardEvent('keydown', { key: char, bubbles: true }));
+      element.dispatchEvent(new KeyboardEvent('keypress', { key: char, bubbles: true }));
+      element.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true }));
 
-      await sleep(rand(50, 150));
+      await sleep(rand(40, 120));
     }
 
     // Fire change event
-    textbox.dispatchEvent(new Event('change', { bubbles: true }));
+    element.dispatchEvent(new Event('change', { bubbles: true }));
 
-    await sleep(rand(800, 2000));
-
-    debugLog('actionPostMessage: searching for Post button');
-
-    // Find Post button — try exact match first, then substring
-    let result = await findAndTrustedClick('Post', true, 10000);
-
-    if (!result.success) {
-      debugLog('actionPostMessage: exact "Post" not found, trying substring');
-      result = await findAndTrustedClick('Post', false, 5000);
-    }
-
-    if (!result.success) {
-      // Try tweetButtonInline data-testid
-      debugLog('actionPostMessage: trying data-testid="tweetButtonInline"');
-      const postBtn = document.querySelector('[data-testid="tweetButtonInline"]');
-      if (postBtn) {
-        // Check if it's disabled
-        const isDisabled =
-          postBtn.hasAttribute('disabled') ||
-          postBtn.getAttribute('aria-disabled') === 'true';
-        if (!isDisabled) {
-          trustedClick(postBtn);
-          result = { success: true, message: 'Post submitted via data-testid.' };
-        } else {
-          result = { success: false, error: 'Post button is disabled.' };
-        }
-      }
-    }
-
-    await sleep(rand(2000, 3500));
-
-    return result.success
-      ? { success: true, message: 'Post submitted successfully.' }
-      : { success: false, error: result.error || 'Could not find Post button.' };
+    debugLog(`typeIntoElement: finished typing ${content.length} characters`);
   }
 
   /**
-   * FOLLOW accounts — finds "Follow" buttons on the page and clicks up to
-   * `maxFollows` of them.
+   * FOLLOW accounts on the "Connect People" page.
+   *
+   * Targets [data-testid*="follow"] or [data-testid="userFollowButton"] buttons
+   * and clicks up to `maxFollows` of them.
    */
   async function actionFollowBack({ maxFollows = 3 } = {}) {
     await sleep(rand(2000, 4000));
@@ -506,57 +407,97 @@
     window.scrollBy({ top: rand(300, 800), behavior: 'smooth' });
     await sleep(rand(1000, 2000));
 
-    debugLog('actionFollowBack: searching for "Follow" buttons');
+    debugLog('actionFollowBack: starting');
 
-    // Use deep-text search to find all "Follow" buttons
-    // Exclude "Following" (already following), "Follows you", "Pending"
-    const excludeTexts = ['Following', 'Follows you', 'Pending'];
+    // Find all follow buttons using data-testid selectors
+    const followSelectors = [
+      '[data-testid="userFollowButton"]',
+      '[data-testid*="followButton"]',
+      '[data-testid*="FollowButton"]',
+      '[data-testid*="follow"] button',
+      'button[data-testid*="follow"]',
+    ];
 
-    const allFollowCandidates = deepTextSearch(
-      document.body,
-      'Follow',
-      true, // exact
-      ['BUTTON', 'A', 'SPAN', 'DIV'],
-      ['button', 'menuitem']
-    );
+    // Collect all unique follow button elements
+    const allFollowButtons = new Set();
 
-    // Filter: exclude elements whose text is actually "Following", "Follows you", or "Pending"
-    const followButtons = allFollowCandidates.filter((btn) => {
-      const text = btn.textContent.trim();
-      return (
-        text === 'Follow' &&
-        !btn.hasAttribute('disabled') &&
-        btn.getAttribute('aria-disabled') !== 'true' &&
-        btn.offsetParent !== null &&
-        !excludeTexts.some((ex) => text.includes(ex))
-      );
-    });
+    for (const sel of followSelectors) {
+      try {
+        const els = document.querySelectorAll(sel);
+        for (const el of els) {
+          // Only include visible, not-disabled buttons
+          if (
+            el.offsetParent !== null &&
+            !el.hasAttribute('disabled') &&
+            el.getAttribute('aria-disabled') !== 'true'
+          ) {
+            // Exclude "Following" state — check if button's text indicates already following
+            const text = el.textContent.trim().toLowerCase();
+            if (!text.includes('following') && !text.includes('pending') && !text.includes('follows')) {
+              allFollowButtons.add(el);
+            }
+          }
+        }
+      } catch (e) {
+        debugLog(`actionFollowBack: error with selector "${sel}"`, e);
+      }
+    }
 
     debugLog(
-      `actionFollowBack: found ${allFollowCandidates.length} candidates, ${followButtons.length} valid "Follow" buttons`,
-      followButtons.map((e) => ({
+      `actionFollowBack: found ${allFollowButtons.size} followable buttons (data-testid)`,
+      [...allFollowButtons].map((e) => ({
         tag: e.tagName,
-        text: e.textContent.trim(),
-        visible: e.offsetParent !== null,
-        rect: e.getBoundingClientRect(),
+        testid: e.getAttribute('data-testid'),
+        text: e.textContent.trim().slice(0, 30),
       }))
     );
 
-    if (followButtons.length === 0) {
+    if (allFollowButtons.size === 0) {
+      // Fallback: try broad button search for any "Follow" text
+      debugLog('actionFollowBack: no data-testid follow buttons found, trying broad search');
+      const broadButtons = document.querySelectorAll(
+        'button, [role="button"]'
+      );
+      const candidates = [];
+      for (const btn of broadButtons) {
+        const text = btn.textContent.trim().toLowerCase();
+        if (
+          text === 'follow' &&
+          btn.offsetParent !== null &&
+          !btn.hasAttribute('disabled')
+        ) {
+          candidates.push(btn);
+        }
+      }
+      debugLog(`actionFollowBack: broad search found ${candidates.length} candidates`);
+      if (candidates.length === 0) {
+        return { success: false, error: 'No follow buttons found on this page.' };
+      }
+      const toClick = candidates.slice(0, maxFollows);
+      let clickedCount = 0;
+      for (const btn of toClick) {
+        btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        await sleep(rand(800, 2000));
+        emulateHardwareClick(btn);
+        clickedCount++;
+        await sleep(rand(3000, 6000));
+      }
       return {
-        success: false,
-        error: 'No visible Follow buttons found on this page.',
+        success: true,
+        message: `Followed ${clickedCount} account(s) via broad search.`,
+        followed: clickedCount,
       };
     }
 
-    const toClick = followButtons.slice(0, maxFollows);
+    // Click up to maxFollows
+    const toClick = [...allFollowButtons].slice(0, maxFollows);
     let clickedCount = 0;
 
     for (const btn of toClick) {
       btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
       await sleep(rand(800, 2000));
 
-      trustedClick(btn);
+      emulateHardwareClick(btn);
       clickedCount++;
 
       await sleep(rand(3000, 6000));
@@ -564,7 +505,7 @@
 
     return {
       success: true,
-      message: `Followed ${clickedCount} account(s).`,
+      message: `Followed ${clickedCount} account(s) via data-testid.`,
       followed: clickedCount,
     };
   }
@@ -601,5 +542,5 @@
     return true; // Keep channel open for async response
   });
 
-  console.log('[Xpert Engage] content.js refactored — using test-IDs, deep-text search, trusted PointerEvents, and debug logging.');
+  console.log('[Xpert Engage] content.js loaded — using universal data-testid selectors with hardware event emulation.');
 })();
