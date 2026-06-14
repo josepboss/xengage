@@ -1,16 +1,16 @@
 /**
- * content.js — X.com DOM Interaction Engine (Universal Selectors)
+ * content.js — X.com DOM Interaction Engine (Language‑Agnostic)
  *
- * Uses language-agnostic data-testid attributes observed from Chrome DevTools
- * recordings instead of text-string matching. This ensures the extension works
- * regardless of X's interface language (English, Korean, Japanese, etc.).
+ * Uses only static, language‑agnostic `data-testid` attributes verified
+ * from Chrome DevTools DOM snapshots. No text‑string searches.
  *
- * Core selectors (verified from actual DOM snapshots):
- *   - Join button:  [data-testid="primaryColumn"] button (within community header)
- *   - Textbox:      [data-testid="tweetTextarea_0"]
- *   - Post button:  [data-testid="tweetButton"]
- *   - Follow:       [data-testid*="follow"] or [data-testid="userFollowButton"]
- *   - Community:    [data-testid*="community"]
+ * Core selectors:
+ *   Join:   [data-testid="primaryColumn"] button  (inside primary column)
+ *   Text:   [data-testid="tweetTextarea_0"]
+ *   Post:   [data-testid="tweetButton"]
+ *   Follow: [data-testid="userFollowButton"] or [data-testid*="follow"]
+ *
+ * Interaction: full hardware state emulation chain (mousedown → mouseup → click)
  */
 
 (function () {
@@ -29,11 +29,11 @@
   }
 
   /* ────────────────────────────────────────────────────────────────
-   *  HARDWARE STATE EMULATION
+   *  HARDWARE STATE EMULATION CHAIN
    *
-   *  Dispatches a full mouse-event chain to simulate a real click.
-   *  X's React heavily gatekeeps synthetic events; this bypass works
-   *  because the event sequence mirrors actual user input.
+   *  Dispatches a full mouse‑event sequence to simulate a real click.
+   *  X's React heavily gatekeeps synthetic events; this sequence works
+   *  because it mirrors actual user input.
    * ──────────────────────────────────────────────────────────────── */
 
   function emulateHardwareClick(element) {
@@ -76,27 +76,13 @@
     // Phase 3: after another brief delay, click
     setTimeout(() => {
       fireMouse('click');
-      // Also fire a PointerEvent click as a safety net
-      const pointerEvent = new PointerEvent('click', {
-        bubbles: true,
-        cancelable: true,
-        composed: true,
-        view: window,
-        clientX: x,
-        clientY: y,
-        pointerType: 'mouse',
-        pointerId: 1,
-        isPrimary: true,
-        isTrusted: true,
-      });
-      element.dispatchEvent(pointerEvent);
     }, rand(100, 220));
   }
 
   /* ────────────────────────────────────────────────────────────────
    *  POLLING HELPER
    *
-   *  Polls a DOM selector every `intervalMs` until the element is found
+   *  Polls a CSS selector every `intervalMs` until the element is found
    *  or the timeout expires. Returns the element or null.
    * ──────────────────────────────────────────────────────────────── */
 
@@ -142,63 +128,21 @@
   }
 
   /* ────────────────────────────────────────────────────────────────
-   *  POLL FOR MULTIPLE SELECTORS (OR logic)
-   * ──────────────────────────────────────────────────────────────── */
-
-  async function pollAnySelector(selectors, timeoutMs = 15000, intervalMs = 500) {
-    const start = Date.now();
-    let attempts = 0;
-
-    while (Date.now() - start < timeoutMs) {
-      attempts++;
-
-      for (const sel of selectors) {
-        const el = document.querySelector(sel);
-        if (el) {
-          const rect = el.getBoundingClientRect();
-          const visible =
-            el.offsetParent !== null &&
-            rect.width > 0 &&
-            rect.height > 0 &&
-            window.getComputedStyle(el).visibility !== 'hidden';
-
-          if (visible) {
-            debugLog(`pollAnySelector: matched "${sel}" in ${attempts} attempts`, {
-              tag: el.tagName,
-              testid: el.getAttribute('data-testid'),
-              rect,
-            });
-            return { selector: sel, element: el };
-          }
-        }
-      }
-
-      debugLog(`pollAnySelector: attempt ${attempts} — none of [${selectors.join(', ')}] visible`);
-      await sleep(intervalMs);
-    }
-
-    debugLog(`pollAnySelector: TIMEOUT after ${attempts} attempts`);
-    return null;
-  }
-
-  /* ────────────────────────────────────────────────────────────────
    *  CORE ACTIONS
    * ──────────────────────────────────────────────────────────────── */
 
   /**
    * JOIN a community.
    *
-   * Strategy: Look for any button inside the primary column that is
-   * styled as an action button (accent background). X's community page
-   * always renders exactly one prominent call-to-action button in the
-   * community header area.
+   * Target: the primary action button inside the primary column header.
+   * Use `[data-testid="primaryColumn"] button` as the anchor.
    */
   async function actionJoinCommunity() {
     await sleep(rand(1500, 3000));
 
     debugLog('actionJoinCommunity: starting');
 
-    // Strategy 1: Primary column button with accent styling
+    // Primary selector: button inside the primary column (community header)
     const joinBtn = await pollSelector(
       '[data-testid="primaryColumn"] button',
       12000
@@ -209,7 +153,7 @@
       emulateHardwareClick(joinBtn);
       await sleep(rand(2000, 3500));
 
-      // Check: Did the button change state? Look for confirmation elements
+      // Check for confirmation state: button may change to "Joined"/"Requested"
       const confirmSelectors = [
         '[data-testid*="community"] button',
         '[role="button"][aria-pressed="true"]',
@@ -225,8 +169,8 @@
       return { success: true, message: 'Join button clicked.' };
     }
 
-    // Strategy 2: Look for any community-related button
-    debugLog('actionJoinCommunity: trying community-related buttons');
+    // Fallback: any button inside any element with data-testid containing "community"
+    debugLog('actionJoinCommunity: trying fallback community button');
     const communityBtn = await pollSelector(
       '[data-testid*="community"] button, [data-testid*="Community"] button',
       8000
@@ -235,29 +179,19 @@
     if (communityBtn) {
       emulateHardwareClick(communityBtn);
       await sleep(rand(2000, 3500));
-      return { success: true, message: 'Community button clicked.' };
+      return { success: true, message: 'Community button clicked (fallback).' };
     }
 
-    // Strategy 3: Broad search — any visible button in the community page area
-    debugLog('actionJoinCommunity: trying broad button search');
-    const anyBtn = await pollSelector(
-      'section[aria-labelledby*="community"] button, div[data-testid*="community"] button',
-      8000
-    );
-
-    if (anyBtn) {
-      emulateHardwareClick(anyBtn);
-      await sleep(rand(2000, 3500));
-      return { success: true, message: 'Found and clicked a community action button.' };
-    }
-
-    return { success: false, error: 'Could not locate a community join button using data-testid selectors.' };
+    return {
+      success: false,
+      error: 'Could not locate a community join button using data-testid selectors.',
+    };
   }
 
   /**
    * POST a message to the community.
    *
-   * Uses the universal test IDs observed in DevTools:
+   * Uses the universal test IDs:
    *   - [data-testid="tweetTextarea_0"] for the text input
    *   - [data-testid="tweetButton"] for the post/submit button
    */
@@ -274,23 +208,55 @@
     const textbox = await pollSelector('[data-testid="tweetTextarea_0"]', 12000);
 
     if (!textbox) {
-      // Fallback: try the common textarea role
-      debugLog('actionPostMessage: tweetTextarea_0 not found, trying contenteditable');
-      const fallback = await pollSelector(
-        'div[role="textbox"][contenteditable="true"]',
-        8000
-      );
-      if (!fallback) {
-        return { success: false, error: 'Text input field not found on page.' };
-      }
-
-      // Use fallback for typing
-      debugLog('actionPostMessage: using fallback contenteditable div');
-      await typeIntoElement(fallback, content);
-    } else {
-      debugLog('actionPostMessage: found [data-testid="tweetTextarea_0"]');
-      await typeIntoElement(textbox, content);
+      debugLog('actionPostMessage: tweetTextarea_0 not found');
+      return { success: false, error: 'Text input field not found on page.' };
     }
+
+    debugLog('actionPostMessage: found [data-testid="tweetTextarea_0"]');
+
+    // Scroll it into view and focus
+    textbox.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    await sleep(rand(400, 800));
+    textbox.focus();
+    await sleep(rand(200, 500));
+
+    // Clear existing content
+    textbox.textContent = '';
+    textbox.dispatchEvent(new Event('input', { bubbles: true }));
+    await sleep(rand(200, 400));
+
+    // Type content character by character
+    for (let i = 0; i < content.length; i++) {
+      const char = content[i];
+
+      textbox.dispatchEvent(
+        new InputEvent('beforeinput', {
+          inputType: 'insertText',
+          data: char,
+          bubbles: true,
+          cancelable: true,
+        })
+      );
+
+      textbox.textContent = (textbox.textContent || '') + char;
+
+      textbox.dispatchEvent(
+        new InputEvent('input', {
+          inputType: 'insertText',
+          data: char,
+          bubbles: true,
+          cancelable: true,
+        })
+      );
+
+      textbox.dispatchEvent(new KeyboardEvent('keydown', { key: char, bubbles: true }));
+      textbox.dispatchEvent(new KeyboardEvent('keypress', { key: char, bubbles: true }));
+      textbox.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true }));
+
+      await sleep(rand(40, 120));
+    }
+
+    textbox.dispatchEvent(new Event('change', { bubbles: true }));
 
     await sleep(rand(800, 2000));
 
@@ -301,7 +267,7 @@
 
     if (!postBtn) {
       // Fallback: try tweetButtonInline
-      debugLog('actionPostMessage: tweetButton not found, trying tweetButtonInline');
+      debugLog('actionPostMessage: tweetButton not found, trying [data-testid="tweetButtonInline"]');
       const fallbackBtn = await pollSelector(
         '[data-testid="tweetButtonInline"]',
         5000
@@ -320,7 +286,6 @@
       return { success: false, error: 'Could not find a Post/Submit button.' };
     }
 
-    // Verify it's not disabled
     const isDisabled =
       postBtn.hasAttribute('disabled') ||
       postBtn.getAttribute('aria-disabled') === 'true';
@@ -330,7 +295,6 @@
       return { success: false, error: 'Post button is disabled (content may be empty or too short).' };
     }
 
-    emulateHard```js
     emulateHardwareClick(postBtn);
     await sleep(rand(2000, 3500));
 
@@ -338,66 +302,9 @@
   }
 
   /**
-   * Type content into a contenteditable element character by character,
-   * simulating human typing intervals.
-   */
-  async function typeIntoElement(element, content) {
-    element.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    await sleep(rand(400, 800));
-
-    element.focus();
-    await sleep(rand(200, 500));
-
-    // Clear existing content first
-    element.textContent = '';
-    element.dispatchEvent(new Event('input', { bubbles: true }));
-
-    await sleep(rand(200, 400));
-
-    for (let i = 0; i < content.length; i++) {
-      const char = content[i];
-
-      // beforeinput
-      element.dispatchEvent(
-        new InputEvent('beforeinput', {
-          inputType: 'insertText',
-          data: char,
-          bubbles: true,
-          cancelable: true,
-        })
-      );
-
-      // Update content
-      element.textContent = (element.textContent || '') + char;
-
-      // input event
-      element.dispatchEvent(
-        new InputEvent('input', {
-          inputType: 'insertText',
-          data: char,
-          bubbles: true,
-          cancelable: true,
-        })
-      );
-
-      // Keyboard events for React's synthetic event listeners
-      element.dispatchEvent(new KeyboardEvent('keydown', { key: char, bubbles: true }));
-      element.dispatchEvent(new KeyboardEvent('keypress', { key: char, bubbles: true }));
-      element.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true }));
-
-      await sleep(rand(40, 120));
-    }
-
-    // Fire change event
-    element.dispatchEvent(new Event('change', { bubbles: true }));
-
-    debugLog(`typeIntoElement: finished typing ${content.length} characters`);
-  }
-
-  /**
    * FOLLOW accounts on the "Connect People" page.
    *
-   * Targets [data-testid*="follow"] or [data-testid="userFollowButton"] buttons
+   * Targets [data-testid="userFollowButton"] or [data-testid*="follow"] buttons
    * and clicks up to `maxFollows` of them.
    */
   async function actionFollowBack({ maxFollows = 3 } = {}) {
@@ -453,40 +360,7 @@
     );
 
     if (allFollowButtons.size === 0) {
-      // Fallback: try broad button search for any "Follow" text
-      debugLog('actionFollowBack: no data-testid follow buttons found, trying broad search');
-      const broadButtons = document.querySelectorAll(
-        'button, [role="button"]'
-      );
-      const candidates = [];
-      for (const btn of broadButtons) {
-        const text = btn.textContent.trim().toLowerCase();
-        if (
-          text === 'follow' &&
-          btn.offsetParent !== null &&
-          !btn.hasAttribute('disabled')
-        ) {
-          candidates.push(btn);
-        }
-      }
-      debugLog(`actionFollowBack: broad search found ${candidates.length} candidates`);
-      if (candidates.length === 0) {
-        return { success: false, error: 'No follow buttons found on this page.' };
-      }
-      const toClick = candidates.slice(0, maxFollows);
-      let clickedCount = 0;
-      for (const btn of toClick) {
-        btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        await sleep(rand(800, 2000));
-        emulateHardwareClick(btn);
-        clickedCount++;
-        await sleep(rand(3000, 6000));
-      }
-      return {
-        success: true,
-        message: `Followed ${clickedCount} account(s) via broad search.`,
-        followed: clickedCount,
-      };
+      return { success: false, error: 'No follow buttons found on this page.' };
     }
 
     // Click up to maxFollows
@@ -542,5 +416,5 @@
     return true; // Keep channel open for async response
   });
 
-  console.log('[Xpert Engage] content.js loaded — using universal data-testid selectors with hardware event emulation.');
+  console.log('[Xpert Engage] content.js loaded — using only language-agnostic data-testid selectors with hardware event emulation.');
 })();
